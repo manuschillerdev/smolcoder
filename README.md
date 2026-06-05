@@ -20,6 +20,7 @@ smolcoder open --ide intellij
 - VS Code Remote-SSH settings:
   - `remote.SSH.enableDynamicForwarding = false`
   - `remote.SSH.useExecServer = false`
+- JetBrains Gateway deep links for IntelliJ remote development
 
 The guest mounts the current workspace at `/workspace`.
 
@@ -35,8 +36,7 @@ smolcoder ensure
 # Print connection details.
 smolcoder status
 
-# Open JetBrains Gateway/IntelliJ and print the generated SSH config.
-# On macOS this tries Gateway/JetBrains Gateway, then IntelliJ IDEA.
+# Open JetBrains Gateway directly into the remote project.
 smolcoder open --ide intellij
 
 # Stop or delete the machine.

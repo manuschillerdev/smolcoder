@@ -142,6 +142,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 host_alias: ctx.state.host_alias.clone(),
                 ssh_config: ctx.ssh_config.clone(),
                 runtime_dir: ctx.runtime_dir.clone(),
+                ssh_port: ctx.state.port,
+                identity_file: ctx.state.identity_file.clone(),
             };
             match cmd.ide {
                 Ide::Code => ide::open_code(
