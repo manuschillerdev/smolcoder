@@ -36,7 +36,7 @@ smolcoder ensure
 smolcoder status
 
 # Open JetBrains Gateway/IntelliJ and print the generated SSH config.
-# On macOS this tries JetBrains Gateway, then IntelliJ IDEA.
+# On macOS this tries Gateway/JetBrains Gateway, then IntelliJ IDEA.
 smolcoder open --ide intellij
 
 # Stop or delete the machine.

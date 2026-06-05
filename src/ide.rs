@@ -149,6 +149,7 @@ fn intellij_command(command: &str, ctx: &LaunchContext, args: &[String]) -> Comm
 
 fn macos_intellij_apps() -> &'static [&'static str] {
     &[
+        "Gateway",
         "JetBrains Gateway",
         "IntelliJ IDEA",
         "IntelliJ IDEA Ultimate",
@@ -222,6 +223,7 @@ mod tests {
 
     #[test]
     fn intellij_app_candidates_include_idea() {
+        assert!(macos_intellij_apps().contains(&"Gateway"));
         assert!(macos_intellij_apps().contains(&"IntelliJ IDEA"));
         assert!(macos_intellij_apps().contains(&"JetBrains Gateway"));
     }
