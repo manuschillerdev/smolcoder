@@ -94,7 +94,6 @@ pub fn open_intellij(ctx: &LaunchContext, options: &IntellijOptions) -> Result<(
     let ssh_id = gateway_ssh_config_id(&ctx.host_alias);
     let gateway_config = GatewaySshConfig {
         id: ssh_id.clone(),
-        name: ctx.host_alias.clone(),
         host: "127.0.0.1".to_string(),
         port: ctx.ssh_port,
         username: "root".to_string(),
@@ -122,7 +121,6 @@ pub fn open_intellij(ctx: &LaunchContext, options: &IntellijOptions) -> Result<(
 #[derive(Debug, Clone)]
 struct GatewaySshConfig {
     id: String,
-    name: String,
     host: String,
     port: u16,
     username: String,
@@ -439,27 +437,75 @@ fn jetbrains_config_base() -> Result<PathBuf> {
 
 fn render_gateway_ssh_config(config: &GatewaySshConfig) -> String {
     format!(
-        "      <sshConfig id=\"{}\" host=\"{}\" port=\"{}\" username=\"{}\" authType=\"KEY_PAIR\" keyPath=\"{}\" nameFormat=\"CUSTOM\" customName=\"{}\" useOpenSSHConfig=\"false\" />\n",
+        "      <sshConfig id=\"{}\" host=\"{}\" port=\"{}\" username=\"{}\" authType=\"KEY_PAIR\" keyPath=\"{}\" useOpenSSHConfig=\"false\" />\n",
         xml_escape(&config.id),
         xml_escape(&config.host),
         config.port,
         xml_escape(&config.username),
         xml_escape(&config.key_path.to_string_lossy()),
-        xml_escape(&config.name),
     )
 }
 
 fn merge_gateway_ssh_config(existing: &str, id: &str, entry: &str) -> String {
     let marker = format!("id=\"{}\"", xml_escape(id));
-    let without_existing = existing
-        .lines()
-        .filter(|line| !line.contains("<sshConfig ") || !line.contains(&marker))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut lines = Vec::new();
+    let mut skip_target_block = false;
+    let mut in_other_block = false;
+    let mut skip_orphaned_smolcoder_close = false;
 
-    if let Some(index) = without_existing.rfind("    </configs>") {
+    for line in existing.lines() {
+        if skip_target_block {
+            if line.contains("</sshConfig>") {
+                skip_target_block = false;
+            }
+            continue;
+        }
+
+        if in_other_block {
+            lines.push(line);
+            if line.contains("</sshConfig>") {
+                in_other_block = false;
+            }
+            continue;
+        }
+
+        if line.contains("<sshConfig") {
+            if line.contains(&marker) {
+                if !line.contains("/>") && !line.contains("</sshConfig>") {
+                    skip_target_block = true;
+                }
+                continue;
+            }
+
+            lines.push(line);
+            if !line.contains("/>") && !line.contains("</sshConfig>") {
+                in_other_block = true;
+            }
+            continue;
+        }
+
+        if line.contains("smolcoder-") && line.contains("<option") {
+            skip_orphaned_smolcoder_close = true;
+            continue;
+        }
+
+        if line.contains("</sshConfig>") {
+            if skip_orphaned_smolcoder_close {
+                skip_orphaned_smolcoder_close = false;
+            }
+            continue;
+        }
+
+        lines.push(line);
+    }
+
+    let without_existing = lines.join("\n");
+    if let Some(tag_index) = without_existing.rfind("</configs>") {
+        let insert_index = without_existing[..tag_index]
+            .rfind('\n')
+            .map_or(tag_index, |index| index + 1);
         let mut out = without_existing;
-        out.insert_str(index, entry);
+        out.insert_str(insert_index, entry);
         if !out.ends_with('\n') {
             out.push('\n');
         }
@@ -658,7 +704,6 @@ mod tests {
     fn gateway_ssh_config_entry_is_stable() {
         let rendered = render_gateway_ssh_config(&GatewaySshConfig {
             id: "smolcoder-test".to_string(),
-            name: "smolcoder-test".to_string(),
             host: "127.0.0.1".to_string(),
             port: 2222,
             username: "root".to_string(),
@@ -668,6 +713,45 @@ mod tests {
         assert!(rendered.contains("id=\"smolcoder-test\""));
         assert!(rendered.contains("authType=\"KEY_PAIR\""));
         assert!(rendered.contains("keyPath=\"/Users/me/.ssh/id_ed25519\""));
+        assert!(!rendered.contains("customName"));
+    }
+
+    #[test]
+    fn gateway_ssh_config_merge_replaces_multiline_entry() {
+        let existing = r#"<application>
+  <component name="SshConfigs">
+    <configs>
+      <sshConfig id="smolcoder-test" host="127.0.0.1">
+        <option name="customName" value="smolcoder-test" />
+      </sshConfig>
+      <sshConfig id="other" host="example.com" />
+    </configs>
+  </component>
+</application>
+"#;
+        let entry = "      <sshConfig id=\"smolcoder-test\" host=\"127.0.0.1\" />\n";
+        let merged = merge_gateway_ssh_config(existing, "smolcoder-test", entry);
+        assert_eq!(merged.matches("id=\"smolcoder-test\"").count(), 1);
+        assert!(merged.contains("id=\"other\""));
+        assert!(!merged.contains("customName"));
+    }
+
+    #[test]
+    fn gateway_ssh_config_merge_repairs_orphaned_smolcoder_fragment() {
+        let existing = r#"<application>
+  <component name="SshConfigs">
+    <configs>
+        <option name="customName" value="smolcoder-test" />
+      </sshConfig>
+    </configs>
+  </component>
+</application>
+"#;
+        let entry = "      <sshConfig id=\"smolcoder-test\" host=\"127.0.0.1\" />\n";
+        let merged = merge_gateway_ssh_config(existing, "smolcoder-test", entry);
+        assert_eq!(merged.matches("<sshConfig").count(), 1);
+        assert_eq!(merged.matches("</sshConfig>").count(), 0);
+        assert!(!merged.contains("customName"));
     }
 
     #[test]
