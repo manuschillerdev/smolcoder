@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use anyhow::{Context, Result, bail};
@@ -88,45 +88,111 @@ pub fn open_intellij(ctx: &LaunchContext, options: &IntellijOptions) -> Result<(
     }
 
     if let Some(command) = &options.command {
-        let status = Command::new(command)
-            .args(&options.extra_args)
-            .env("SMOLCODER_SSH_CONFIG", &ctx.ssh_config)
-            .env("SMOLCODER_HOST", &ctx.host_alias)
-            .env("SMOLCODER_REMOTE_PATH", "/workspace")
-            .status()
-            .with_context(|| format!("launch IntelliJ/Gateway with {command}"))?;
-        if !status.success() {
-            bail!("IntelliJ/Gateway command exited with status {status}");
-        }
-        return Ok(());
+        return launch_intellij_command(ctx, command, &options.extra_args);
     }
 
-    if cfg!(target_os = "macos") {
-        let status = Command::new("open")
-            .arg("-a")
-            .arg("JetBrains Gateway")
-            .status()
-            .context("open JetBrains Gateway")?;
-        if status.success() {
+    for app in macos_intellij_apps() {
+        if try_open_macos_app(app, &options.extra_args)? {
+            println!("Opened {app}. Use the SSH connection details above.");
             return Ok(());
         }
     }
 
-    for binary in ["jetbrains-gateway", "gateway"] {
-        if let Ok(status) = Command::new(binary)
-            .args(&options.extra_args)
-            .env("SMOLCODER_SSH_CONFIG", &ctx.ssh_config)
-            .env("SMOLCODER_HOST", &ctx.host_alias)
-            .env("SMOLCODER_REMOTE_PATH", "/workspace")
-            .status()
+    for binary in ["idea", "jetbrains-gateway", "gateway"] {
+        if let Ok(status) = intellij_command(binary, ctx, &options.extra_args).status()
             && status.success()
         {
             return Ok(());
         }
     }
 
-    println!("Open JetBrains Gateway or IntelliJ manually and use the SSH config above.");
+    println!("Could not launch JetBrains Gateway or IntelliJ automatically.");
+    println!("Open IntelliJ IDEA manually and use the SSH config above.");
     Ok(())
+}
+
+fn launch_intellij_command(ctx: &LaunchContext, command: &str, args: &[String]) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        let path = Path::new(command);
+        if path.extension().is_some_and(|ext| ext == "app") {
+            if try_open_macos_app_path(path, args)? {
+                return Ok(());
+            }
+            bail!("could not open macOS application {}", path.display());
+        }
+
+        if command.chars().any(char::is_whitespace) {
+            if try_open_macos_app(command, args)? {
+                return Ok(());
+            }
+            bail!("could not open macOS application '{command}'");
+        }
+    }
+
+    let status = intellij_command(command, ctx, args)
+        .status()
+        .with_context(|| format!("launch IntelliJ/Gateway with {command}"))?;
+    if !status.success() {
+        bail!("IntelliJ/Gateway command exited with status {status}");
+    }
+    Ok(())
+}
+
+fn intellij_command(command: &str, ctx: &LaunchContext, args: &[String]) -> Command {
+    let mut cmd = Command::new(command);
+    cmd.args(args)
+        .env("SMOLCODER_SSH_CONFIG", &ctx.ssh_config)
+        .env("SMOLCODER_HOST", &ctx.host_alias)
+        .env("SMOLCODER_REMOTE_PATH", "/workspace");
+    cmd
+}
+
+fn macos_intellij_apps() -> &'static [&'static str] {
+    &[
+        "JetBrains Gateway",
+        "IntelliJ IDEA",
+        "IntelliJ IDEA Ultimate",
+        "IntelliJ IDEA CE",
+        "IntelliJ IDEA Community Edition",
+    ]
+}
+
+fn try_open_macos_app(app: &str, args: &[String]) -> Result<bool> {
+    if !cfg!(target_os = "macos") {
+        return Ok(false);
+    }
+
+    let mut command = Command::new("open");
+    command
+        .arg("-a")
+        .arg(app)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if !args.is_empty() {
+        command.arg("--args").args(args);
+    }
+
+    let status = command
+        .status()
+        .with_context(|| format!("open macOS application '{app}'"))?;
+    Ok(status.success())
+}
+
+fn try_open_macos_app_path(app: &Path, args: &[String]) -> Result<bool> {
+    if !cfg!(target_os = "macos") {
+        return Ok(false);
+    }
+
+    let mut command = Command::new("open");
+    command.arg(app).stdout(Stdio::null()).stderr(Stdio::null());
+    if !args.is_empty() {
+        command.arg("--args").args(args);
+    }
+
+    let status = command
+        .status()
+        .with_context(|| format!("open macOS application {}", app.display()))?;
+    Ok(status.success())
 }
 
 fn write_code_settings(path: &Path, host_alias: &str, ssh_config: &Path) -> Result<()> {
@@ -153,6 +219,12 @@ fn write_code_settings(path: &Path, host_alias: &str, ssh_config: &Path) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intellij_app_candidates_include_idea() {
+        assert!(macos_intellij_apps().contains(&"IntelliJ IDEA"));
+        assert!(macos_intellij_apps().contains(&"JetBrains Gateway"));
+    }
 
     #[test]
     fn code_settings_include_remote_ssh_workarounds() {
