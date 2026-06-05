@@ -112,30 +112,28 @@ pub fn write_ssh_config(path: &Path, spec: &SshConfigSpec) -> Result<()> {
 pub fn wait_for_ssh(config: &Path, host_alias: &str, timeout: Duration) -> Result<()> {
     let start = Instant::now();
     let mut last_error = String::new();
+    let mut consecutive_successes = 0;
 
     while start.elapsed() < timeout {
-        let output = Command::new("ssh")
-            .arg("-F")
-            .arg(config)
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=3")
-            .arg(host_alias)
-            .arg("true")
-            .output()
-            .with_context(|| "run ssh readiness check")?;
+        let output =
+            ssh_ready_probe(config, host_alias).with_context(|| "run ssh readiness check")?;
 
         if output.status.success() {
-            return Ok(());
+            consecutive_successes += 1;
+            if consecutive_successes >= 3 {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_secs(1));
+            continue;
         }
 
+        consecutive_successes = 0;
         last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
         thread::sleep(Duration::from_secs(2));
     }
 
     bail!(
-        "SSH did not become ready for host '{}' within {}s{}",
+        "SSH did not become stable for host '{}' within {}s{}",
         host_alias,
         timeout.as_secs(),
         if last_error.is_empty() {
@@ -144,6 +142,22 @@ pub fn wait_for_ssh(config: &Path, host_alias: &str, timeout: Duration) -> Resul
             format!(": {last_error}")
         }
     )
+}
+
+fn ssh_ready_probe(config: &Path, host_alias: &str) -> std::io::Result<std::process::Output> {
+    Command::new("ssh")
+        .arg("-F")
+        .arg(config)
+        .arg("-T")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=3")
+        .arg("-o")
+        .arg("ConnectionAttempts=1")
+        .arg(host_alias)
+        .arg("uname -sm >/dev/null && test -d /workspace")
+        .output()
 }
 
 pub fn choose_port(requested: Option<u16>, reusable: Option<u16>) -> Result<u16> {
