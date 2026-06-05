@@ -21,6 +21,7 @@ smolcoder open --ide intellij
   - `remote.SSH.enableDynamicForwarding = false`
   - `remote.SSH.useExecServer = false`
 - JetBrains Gateway deep links for IntelliJ remote development
+- Gateway is restarted on macOS when needed so generated SSH connections are loaded
 
 The guest mounts the current workspace at `/workspace`.
 

@@ -2,6 +2,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -113,6 +115,7 @@ pub fn open_intellij(ctx: &LaunchContext, options: &IntellijOptions) -> Result<(
         return Ok(());
     }
 
+    prepare_gateway_for_generated_config(options)?;
     open_gateway_url(&url, options)
 }
 
@@ -177,6 +180,24 @@ fn gateway_connect_url(spec: &GatewayConnectUrl<'_>) -> String {
         .collect::<Vec<_>>()
         .join("&");
     format!("jetbrains-gateway://connect#{encoded}")
+}
+
+fn prepare_gateway_for_generated_config(options: &IntellijOptions) -> Result<()> {
+    if !cfg!(target_os = "macos") || options.command.is_some() {
+        return Ok(());
+    }
+
+    let running = running_macos_gateway_apps()?;
+    if running.is_empty() {
+        return Ok(());
+    }
+
+    println!("Restarting JetBrains Gateway so it reloads the generated SSH connection...");
+    for app in &running {
+        quit_macos_app(app)?;
+    }
+    wait_for_macos_gateway_shutdown()?;
+    Ok(())
 }
 
 fn open_gateway_url(url: &str, options: &IntellijOptions) -> Result<()> {
@@ -289,6 +310,61 @@ fn try_open_macos_app_path_with_url(app: &Path, url: &str, args: &[String]) -> R
         .status()
         .with_context(|| format!("open macOS application {}", app.display()))?;
     Ok(status.success())
+}
+
+fn running_macos_gateway_apps() -> Result<Vec<&'static str>> {
+    let mut running = Vec::new();
+    for app in ["Gateway", "JetBrains Gateway"] {
+        if macos_app_is_running(app)? {
+            running.push(app);
+        }
+    }
+    Ok(running)
+}
+
+fn wait_for_macos_gateway_shutdown() -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if running_macos_gateway_apps()?.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "JetBrains Gateway is still running; quit it and rerun smolcoder open --ide intellij"
+            );
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn macos_app_is_running(app: &str) -> Result<bool> {
+    let script = format!("application {} is running", applescript_string(app));
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .with_context(|| format!("check whether {app} is running"))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
+}
+
+fn quit_macos_app(app: &str) -> Result<()> {
+    let script = format!("tell application {} to quit", applescript_string(app));
+    let status = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .status()
+        .with_context(|| format!("quit {app}"))?;
+    if !status.success() {
+        bail!("could not quit {app}");
+    }
+    Ok(())
+}
+
+fn applescript_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn write_gateway_ssh_config(config: &GatewaySshConfig) -> Result<()> {
