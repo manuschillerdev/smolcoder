@@ -329,11 +329,34 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
         },
     )?;
 
-    ssh::wait_for_ssh(
+    if let Err(error) = ssh::wait_for_ssh(
         &ssh_config,
         &desired.host_alias,
         Duration::from_secs(opts.ssh_timeout),
-    )?;
+    ) {
+        let first_error = format!("{error:#}");
+        println!(
+            "SSH did not answer on 127.0.0.1:{}; restarting {} to refresh port forwarding...",
+            desired.port, machine
+        );
+        smolvm
+            .stop(&machine)
+            .with_context(|| format!("stop {} after SSH readiness failure", machine))?;
+        smolvm
+            .start(&machine)
+            .with_context(|| format!("restart {} after SSH readiness failure", machine))?;
+        ssh::wait_for_ssh(
+            &ssh_config,
+            &desired.host_alias,
+            Duration::from_secs(opts.ssh_timeout),
+        )
+        .with_context(|| {
+            format!(
+                "SSH did not recover after restarting {}; initial error: {first_error}",
+                machine
+            )
+        })?;
+    }
 
     Ok(MachineContext {
         state: desired,
