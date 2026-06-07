@@ -39,6 +39,9 @@ enum Commands {
     SshConfig(EnsureCmd),
     /// Check required host tools.
     Doctor,
+    /// Internal: boot a VM subprocess.
+    #[command(name = "_boot-vm", hide = true)]
+    BootVm { config: PathBuf },
 }
 
 #[derive(Debug, Args)]
@@ -130,6 +133,10 @@ struct MachineContext {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    if let Commands::BootVm { config } = cli.command {
+        return ::smolvm::boot::run(config).map_err(Into::into);
+    }
+
     let smolvm = Smolvm::new()?;
 
     match cli.command {
@@ -175,6 +182,7 @@ pub fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Doctor => doctor(&smolvm),
+        Commands::BootVm { .. } => unreachable!("handled before runtime initialization"),
     }
 }
 
