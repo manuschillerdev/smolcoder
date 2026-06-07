@@ -6,8 +6,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::{
     ide::{self, CodeOptions, Ide, IntellijOptions, LaunchContext},
     paths,
-    smolfile::{self, SmolfileSpec},
-    smolvm::{GUEST_IMAGE, MachineConfig, Smolvm},
+    smolvm::{MachineConfig, Smolvm},
     ssh::{self, AuthOptions, SshConfigSpec},
     state::WorkspaceState,
 };
@@ -144,9 +143,10 @@ pub fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         Commands::Open(cmd) => {
+            validate_open_cmd(&cmd)?;
             let ctx = ensure_machine(&smolvm, &cmd.machine)?;
             let launch = LaunchContext {
-                host_alias: ctx.state.host_alias.clone(),
+                host_alias: ctx.state.machine.clone(),
                 ssh_config: ctx.ssh_config.clone(),
                 runtime_dir: ctx.runtime_dir.clone(),
                 ssh_port: ctx.state.port,
@@ -190,6 +190,30 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 }
 
+fn validate_open_cmd(cmd: &OpenCmd) -> Result<()> {
+    match cmd.ide {
+        Ide::Code => {
+            if cmd.intellij.is_some() {
+                bail!("--intellij only applies with --ide intellij");
+            }
+            if cmd.reset_intellij_cache {
+                bail!("--reset-intellij-cache only applies with --ide intellij");
+            }
+        }
+        Ide::Intellij => {
+            if cmd.code.is_some() {
+                bail!("--code only applies with --ide code");
+            }
+            if cmd.machine.authorized_keys.is_some() && cmd.machine.identity_file.is_none() {
+                bail!(
+                    "--authorized-keys with --ide intellij also requires --identity-file; prefer --public-key for automatic key pairing"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> {
     let workspace = paths::canonical_workspace(&opts.workspace)?;
     let workspace_id = paths::workspace_id(&workspace);
@@ -224,15 +248,12 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
     }
 
     if let Some(machine_status) = &status
-        && machine_status.image.as_deref() != Some(GUEST_IMAGE)
+        && !machine_status.is_compatible()
         && !opts.recreate
     {
-        let current = machine_status.image.as_deref().unwrap_or("bare VM");
         bail!(
-            "machine '{}' uses {} but smolcoder requires image {}; pass --recreate to rebuild it",
-            machine,
-            current,
-            GUEST_IMAGE
+            "machine '{}' does not match the current smolcoder guest profile; pass --recreate to rebuild it",
+            machine
         );
     }
 
@@ -250,7 +271,7 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
         .map(|state| state.port);
     let status_is_running = status
         .as_ref()
-        .is_some_and(|machine_status| machine_status.state.is_running());
+        .is_some_and(|machine_status| machine_status.is_running());
     let mut port = ssh::choose_port(opts.port, reusable_port)?;
 
     if !status_is_running && !ssh::port_is_available(port) {
@@ -269,44 +290,34 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
         },
     )?;
 
-    let smolfile_path = state_dir.join("Smolfile");
     let desired = WorkspaceState {
         workspace_id: workspace_id.clone(),
         workspace: workspace.clone(),
         machine: machine.clone(),
-        host_alias: machine.clone(),
         port,
-        authorized_keys: auth.authorized_keys.clone(),
         identity_file: auth.identity_file.clone(),
-        smolfile: smolfile_path.clone(),
         cpus: opts.cpus,
         memory_mib: opts.memory_mib,
         storage_gb: opts.storage_gb,
         overlay_gb: opts.overlay_gb,
     };
 
-    let rendered = smolfile::render(&SmolfileSpec {
-        workspace: desired.workspace.clone(),
-        authorized_keys: desired.authorized_keys.clone(),
-        port: desired.port,
-        cpus: desired.cpus,
-        memory_mib: desired.memory_mib,
-        storage_gb: desired.storage_gb,
-        overlay_gb: desired.overlay_gb,
-    });
-    fs::write(&smolfile_path, rendered)
-        .with_context(|| format!("write Smolfile {}", smolfile_path.display()))?;
-
     match &status {
         None => {
-            smolvm.create(&machine, &machine_config_from_state(&desired))?;
+            smolvm.create(
+                &machine,
+                &machine_config_from_state(&desired, &auth.authorized_keys),
+            )?;
             status = smolvm.status(&machine)?;
         }
-        Some(machine_status) if !machine_status.state.is_running() => {
+        Some(machine_status) if !machine_status.is_running() => {
             if let Some(previous) = previous.as_ref().filter(|state| state.machine == machine)
                 && previous.needs_machine_update(&desired)
             {
-                smolvm.update(&machine, &machine_config_from_state(&desired))?;
+                smolvm.update(
+                    &machine,
+                    &machine_config_from_state(&desired, &auth.authorized_keys),
+                )?;
                 status = smolvm.status(&machine)?;
             }
         }
@@ -326,11 +337,10 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
 
     if !status
         .as_ref()
-        .is_some_and(|machine_status| machine_status.state.is_running())
+        .is_some_and(|machine_status| machine_status.is_running())
     {
         smolvm.start(&machine)?;
     }
-    smolvm.configure_ssh(&machine, &desired.authorized_keys)?;
 
     let runtime_dir = paths::runtime_dir(&workspace_id);
     if runtime_dir.exists() {
@@ -345,7 +355,7 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
     ssh::write_ssh_config(
         &ssh_config,
         &SshConfigSpec {
-            host_alias: desired.host_alias.clone(),
+            host_alias: desired.machine.clone(),
             port: desired.port,
             known_hosts,
             identity_file: desired.identity_file.clone(),
@@ -354,7 +364,7 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
 
     if let Err(error) = ssh::wait_for_ssh(
         &ssh_config,
-        &desired.host_alias,
+        &desired.machine,
         Duration::from_secs(opts.ssh_timeout),
     ) {
         let first_error = format!("{error:#}");
@@ -368,10 +378,9 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
         smolvm
             .start(&machine)
             .with_context(|| format!("restart {} after SSH readiness failure", machine))?;
-        smolvm.configure_ssh(&machine, &desired.authorized_keys)?;
         ssh::wait_for_ssh(
             &ssh_config,
-            &desired.host_alias,
+            &desired.machine,
             Duration::from_secs(opts.ssh_timeout),
         )
         .with_context(|| {
@@ -390,7 +399,10 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
     })
 }
 
-fn machine_config_from_state(state: &WorkspaceState) -> MachineConfig {
+fn machine_config_from_state(
+    state: &WorkspaceState,
+    authorized_keys: &std::path::Path,
+) -> MachineConfig {
     MachineConfig {
         workspace: state.workspace.clone(),
         port: state.port,
@@ -398,6 +410,7 @@ fn machine_config_from_state(state: &WorkspaceState) -> MachineConfig {
         memory_mib: state.memory_mib,
         storage_gb: state.storage_gb,
         overlay_gb: state.overlay_gb,
+        authorized_keys: authorized_keys.to_path_buf(),
     }
 }
 
@@ -431,8 +444,7 @@ fn print_status(smolvm: &Smolvm, cmd: &TargetCmd) -> Result<()> {
         "State: {}",
         status
             .as_ref()
-            .map(|status| status.state.as_str())
-            .unwrap_or("missing")
+            .map_or_else(|| "missing".to_string(), |status| status.state.to_string())
     );
     if let Some(state) = state {
         println!("Workspace: {}", state.workspace.display());
@@ -453,11 +465,11 @@ fn print_status(smolvm: &Smolvm, cmd: &TargetCmd) -> Result<()> {
 fn stop_machine(smolvm: &Smolvm, cmd: &TargetCmd) -> Result<()> {
     let (machine, _, _, _) = resolve_target(cmd)?;
     match smolvm.status(&machine)? {
-        Some(status) if status.state.is_running() => {
+        Some(status) if status.is_running() => {
             smolvm.stop(&machine)?;
             println!("Stopped {}", machine);
         }
-        Some(status) => println!("Machine {} is {}", machine, status.state.as_str()),
+        Some(status) => println!("Machine {} is {}", machine, status.state),
         None => println!("Machine {} is missing", machine),
     }
     Ok(())
