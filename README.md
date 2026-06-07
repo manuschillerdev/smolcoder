@@ -54,6 +54,7 @@ smolcoder open --port 2222
 smolcoder open --public-key ~/.ssh/id_ed25519.pub
 smolcoder open --authorized-keys /absolute/path/to/authorized_keys
 smolcoder open --recreate
+smolcoder open --ide intellij --reset-intellij-cache
 ```
 
 ## Requirements
@@ -62,3 +63,11 @@ smolcoder open --recreate
 - `code` in `PATH` for VS Code launches
 - A usable SSH public key, or an explicit `--public-key` / `--authorized-keys`
 - The guest must be image-backed with a glibc Linux base for JetBrains Remote Development. `smolcoder` creates `debian:bookworm-slim`; recreate older bare/Alpine machines with `smolcoder open --recreate --ide intellij`.
+
+## Troubleshooting
+
+If JetBrains reports `Please try to reinstall the IDE` or a JBR `lib/modules size has changed` error, clear the remote IDE backend cache and retry:
+
+```bash
+smolcoder open --ide intellij --reset-intellij-cache
+```

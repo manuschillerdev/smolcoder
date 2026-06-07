@@ -61,6 +61,9 @@ struct OpenCmd {
     #[arg(long)]
     no_launch: bool,
 
+    #[arg(long)]
+    reset_intellij_cache: bool,
+
     #[arg(last = true)]
     ide_args: Vec<String>,
 }
@@ -163,6 +166,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     &IntellijOptions {
                         command: cmd.intellij,
                         no_launch: cmd.no_launch,
+                        reset_cache: cmd.reset_intellij_cache,
                         extra_args: cmd.ide_args,
                     },
                 ),

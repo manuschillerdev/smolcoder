@@ -36,6 +36,7 @@ pub struct CodeOptions {
 pub struct IntellijOptions {
     pub command: Option<String>,
     pub no_launch: bool,
+    pub reset_cache: bool,
     pub extra_args: Vec<String>,
 }
 
@@ -91,6 +92,9 @@ pub fn open_intellij(ctx: &LaunchContext, options: &IntellijOptions) -> Result<(
     let backend = find_intellij_backend()?;
     let remote_arch = remote_uname_m(ctx)?;
     let source_url = backend.download_url_for_arch(&remote_arch)?;
+    if options.reset_cache {
+        reset_remote_dev_cache(ctx, &backend, &remote_arch)?;
+    }
     let ssh_id = gateway_ssh_config_id(&ctx.host_alias);
     let gateway_config = GatewaySshConfig {
         id: ssh_id.clone(),
@@ -145,20 +149,28 @@ struct JetBrainsBackend {
 
 impl JetBrainsBackend {
     fn download_url_for_arch(&self, arch: &str) -> Result<String> {
-        let prefix = match self.product_code.as_str() {
-            "IU" => "ideaIU",
-            "IC" => "ideaIC",
-            other => bail!("unsupported IntelliJ product code '{other}'"),
-        };
+        Ok(format!(
+            "https://download.jetbrains.com/idea/{}.tar.gz",
+            self.archive_stem_for_arch(arch)?
+        ))
+    }
+
+    fn archive_stem_for_arch(&self, arch: &str) -> Result<String> {
+        let prefix = self.archive_prefix()?;
         let arch_suffix = match arch.trim() {
             "x86_64" | "amd64" => "",
             "aarch64" | "arm64" => "-aarch64",
             other => bail!("unsupported remote architecture '{other}' for JetBrains backend"),
         };
-        Ok(format!(
-            "https://download.jetbrains.com/idea/{prefix}-{}{arch_suffix}.tar.gz",
-            self.version
-        ))
+        Ok(format!("{prefix}-{}{arch_suffix}", self.version))
+    }
+
+    fn archive_prefix(&self) -> Result<&'static str> {
+        match self.product_code.as_str() {
+            "IU" => Ok("ideaIU"),
+            "IC" => Ok("ideaIC"),
+            other => bail!("unsupported IntelliJ product code '{other}'"),
+        }
     }
 }
 
@@ -192,7 +204,9 @@ fn prepare_gateway_for_generated_config(options: &IntellijOptions) -> Result<()>
 
     println!("Restarting JetBrains Gateway so it reloads the generated SSH connection...");
     for app in &running {
-        quit_macos_app(app)?;
+        quit_macos_app(app).with_context(|| {
+            format!("quit {app}; quit Gateway manually and rerun smolcoder open --ide intellij")
+        })?;
     }
     wait_for_macos_gateway_shutdown()?;
     Ok(())
@@ -350,13 +364,16 @@ fn macos_app_is_running(app: &str) -> Result<bool> {
 
 fn quit_macos_app(app: &str) -> Result<()> {
     let script = format!("tell application {} to quit", applescript_string(app));
-    let status = Command::new("osascript")
+    let output = Command::new("osascript")
         .arg("-e")
         .arg(script)
-        .status()
+        .output()
         .with_context(|| format!("quit {app}"))?;
-    if !status.success() {
-        bail!("could not quit {app}");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        bail!("could not quit {app}: {detail}");
     }
     Ok(())
 }
@@ -541,6 +558,42 @@ fn remote_uname_m(ctx: &LaunchContext) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn reset_remote_dev_cache(
+    ctx: &LaunchContext,
+    backend: &JetBrainsBackend,
+    remote_arch: &str,
+) -> Result<()> {
+    let archive_stem = backend.archive_stem_for_arch(remote_arch)?;
+    println!("Clearing JetBrains RemoteDev cache for {archive_stem}...");
+    let script = format!(
+        r#"set -eu
+stem={stem}
+dist="${{HOME:-/root}}/.cache/JetBrains/RemoteDev/dist"
+[ -d "$dist" ] || exit 0
+find "$dist" -maxdepth 1 \( -type d -o -type f \) \
+  \( -name "*_$stem" -o -name "*_$stem.tar.gz" -o -name "$stem.tar.gz" \) \
+  -exec rm -rf -- {{}} +
+"#,
+        stem = shell_single_quote(&archive_stem)
+    );
+    let output = Command::new("ssh")
+        .arg("-F")
+        .arg(&ctx.ssh_config)
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(&ctx.host_alias)
+        .arg(script)
+        .output()
+        .context("clear JetBrains RemoteDev cache")?;
+    if !output.status.success() {
+        bail!(
+            "clear JetBrains RemoteDev cache failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 fn find_intellij_backend() -> Result<JetBrainsBackend> {
     for app in find_intellij_apps()? {
         if let Some(info) = read_intellij_info(&app)? {
@@ -659,6 +712,10 @@ fn write_code_settings(path: &Path, host_alias: &str, ssh_config: &Path) -> Resu
         .with_context(|| format!("write VS Code settings {}", path.display()))
 }
 
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn url_encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
@@ -769,6 +826,15 @@ mod tests {
             backend.download_url_for_arch("aarch64").unwrap(),
             "https://download.jetbrains.com/idea/ideaIU-2025.3.4-aarch64.tar.gz"
         );
+    }
+
+    #[test]
+    fn shell_quote_handles_single_quotes() {
+        assert_eq!(
+            shell_single_quote("ideaIU-2025.3.4-aarch64"),
+            "'ideaIU-2025.3.4-aarch64'"
+        );
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]
