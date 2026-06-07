@@ -1,219 +1,212 @@
-use std::{
-    ffi::OsString,
-    path::Path,
-    process::{Command, Output},
+use std::path::PathBuf;
+
+use ::smolvm as smolvm_crate;
+use anyhow::{Context, Result};
+use smolvm_crate::{
+    HostMount, RecordState,
+    data::network::PortMapping,
+    machine::{
+        CreateMachine, DeleteMachine, GetMachine, LocalMachineService, MachineService,
+        StartMachine, StopMachine, UpdateMachine,
+    },
+    network::NetworkBackend,
 };
-
-use anyhow::{Context, Result, bail};
-use serde::Deserialize;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MachineState {
-    Running,
-    Stopped,
-    Created,
-    Failed,
-    Unreachable,
-    Other(String),
-}
-
-impl MachineState {
-    pub fn is_running(&self) -> bool {
-        matches!(self, Self::Running)
-    }
-
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Running => "running",
-            Self::Stopped => "stopped",
-            Self::Created => "created",
-            Self::Failed => "failed",
-            Self::Unreachable => "unreachable",
-            Self::Other(value) => value.as_str(),
-        }
-    }
-}
-
-impl From<String> for MachineState {
-    fn from(value: String) -> Self {
-        match value.as_str() {
-            "running" => Self::Running,
-            "stopped" => Self::Stopped,
-            "created" => Self::Created,
-            "failed" => Self::Failed,
-            "unreachable" => Self::Unreachable,
-            _ => Self::Other(value),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct MachineStatus {
-    pub state: MachineState,
+    pub state: RecordState,
+    pub image: Option<String>,
+    pub profile_version: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct StatusJson {
-    state: String,
+impl MachineStatus {
+    pub fn is_running(&self) -> bool {
+        self.state == RecordState::Running
+    }
+
+    pub fn is_compatible(&self) -> bool {
+        self.image.as_deref() == Some(GUEST_IMAGE)
+            && self.profile_version.as_deref() == Some(GUEST_PROFILE_VERSION)
+    }
 }
+
+pub const GUEST_IMAGE: &str = "debian:bookworm-slim";
+const GUEST_PROFILE_ENV: &str = "SMOLCODER_GUEST_PROFILE";
+const GUEST_PROFILE_VERSION: &str = "1";
+
+const GUEST_INIT: &str = r#"set -eu
+export DEBIAN_FRONTEND=noninteractive
+
+if ! command -v sshd >/dev/null 2>&1; then
+  apt-get update
+  apt-get install -y --no-install-recommends \
+    openssh-server git ca-certificates curl tar gzip unzip procps libstdc++6 bash
+  rm -rf /var/lib/apt/lists/*
+fi
+
+chown root:root /root 2>/dev/null || true
+chmod 700 /root 2>/dev/null || true
+: "${AUTHORIZED_KEYS:?smolcoder did not provide AUTHORIZED_KEYS}"
+install -d -m 700 /root/.ssh
+printf '%s\n' "$AUTHORIZED_KEYS" > /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+unset AUTHORIZED_KEYS
+
+ssh-keygen -A
+mkdir -p /run/sshd /etc/ssh/sshd_config.d /var/empty
+chown root:root /var/empty
+chmod 755 /var/empty
+cat > /etc/ssh/sshd_config.d/99-smolcoder.conf <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin prohibit-password
+SetEnv SSH_AUTH_SOCK=/tmp/ssh-agent.sock
+EOF
+"#;
 
 #[derive(Debug, Clone)]
+pub struct MachineConfig {
+    pub workspace: PathBuf,
+    pub port: u16,
+    pub cpus: u8,
+    pub memory_mib: u32,
+    pub storage_gb: u64,
+    pub overlay_gb: u64,
+    pub authorized_keys: PathBuf,
+}
+
+#[derive(Clone)]
 pub struct Smolvm {
-    bin: OsString,
+    service: LocalMachineService,
 }
 
 impl Smolvm {
-    pub fn new(bin: impl Into<OsString>) -> Self {
-        Self { bin: bin.into() }
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            service: LocalMachineService::new().context("initialize smolvm machine service")?,
+        })
     }
 
     pub fn status(&self, name: &str) -> Result<Option<MachineStatus>> {
-        let output = Command::new(&self.bin)
-            .args(["machine", "status", "--name", name, "--json"])
-            .output()
-            .with_context(|| format!("run {} machine status", self.display_bin()))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let combined = format!("{stderr}\n{stdout}");
-            if combined.contains("not found") || combined.contains("Vm not found") {
-                return Ok(None);
-            }
-            bail!("smolvm status failed: {}", format_output(&output));
-        }
-
-        let parsed: StatusJson = serde_json::from_slice(&output.stdout)
-            .with_context(|| format!("parse smolvm status for machine '{name}'"))?;
-        Ok(Some(MachineStatus {
-            state: MachineState::from(parsed.state),
+        let status = self
+            .service
+            .status(GetMachine::new(name.to_string()))
+            .with_context(|| format!("load smolvm machine '{name}'"))?;
+        Ok(status.map(|status| MachineStatus {
+            state: status.state,
+            image: status.record.image.clone(),
+            profile_version: status
+                .record
+                .env
+                .iter()
+                .find_map(|(key, value)| (key == GUEST_PROFILE_ENV).then(|| value.clone())),
         }))
     }
 
-    pub fn create(&self, name: &str, smolfile: &Path) -> Result<()> {
-        self.checked(
-            Command::new(&self.bin)
-                .arg("machine")
-                .arg("create")
-                .arg(name)
-                .arg("-s")
-                .arg(smolfile)
-                .arg("--net-backend")
-                .arg("virtio-net"),
-            "create machine",
-        )
+    pub fn create(&self, name: &str, config: &MachineConfig) -> Result<()> {
+        let mut request = CreateMachine::new(name.to_string());
+        request.image = Some(GUEST_IMAGE.to_string());
+        request.init = vec![GUEST_INIT.into()];
+        request.cmd = vec!["/usr/sbin/sshd".into(), "-D".into(), "-e".into()];
+        request.env = vec![format!("{GUEST_PROFILE_ENV}={GUEST_PROFILE_VERSION}")];
+        request.secret_refs.insert(
+            "AUTHORIZED_KEYS".into(),
+            smolvm_crate::secrets::file_ref(config.authorized_keys.clone()),
+        );
+        request.mounts = vec![workspace_mount(config)?];
+        request.ports = vec![ssh_port(config)?];
+        request.net = true;
+        request.network_backend = Some(NetworkBackend::VirtioNet);
+        request.cpus = config.cpus;
+        request.memory_mib = config.memory_mib;
+        request.storage_gb = Some(config.storage_gb);
+        request.overlay_gb = Some(config.overlay_gb);
+        request.ssh_agent = true;
+        self.service
+            .create(request)
+            .with_context(|| format!("create smolvm machine '{name}'"))?;
+        Ok(())
+    }
+
+    pub fn update(&self, name: &str, config: &MachineConfig) -> Result<()> {
+        let desired_mount = workspace_mount(config)?;
+        let desired_port = ssh_port(config)?;
+        let status = self
+            .service
+            .status(GetMachine::new(name.to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("machine '{name}' not found"))?;
+
+        let mut request = UpdateMachine::new(name.to_string());
+        let existing_mounts: Vec<_> = status.record.host_mounts();
+        request.remove_mounts = existing_mounts
+            .iter()
+            .filter(|mount| **mount != desired_mount)
+            .cloned()
+            .collect();
+        if !existing_mounts.contains(&desired_mount) {
+            request.add_mounts.push(desired_mount);
+        }
+
+        let existing_ports: Vec<_> = status.record.port_mappings();
+        request.remove_ports = existing_ports
+            .iter()
+            .filter(|port| **port != desired_port)
+            .copied()
+            .collect();
+        if !existing_ports.contains(&desired_port) {
+            request.add_ports.push(desired_port);
+        }
+
+        request.cpus = Some(config.cpus);
+        request.memory_mib = Some(config.memory_mib);
+        request.storage_gb = Some(config.storage_gb);
+        request.overlay_gb = Some(config.overlay_gb);
+        request.enable_network = true;
+        request.network_backend = Some(NetworkBackend::VirtioNet);
+        request.enable_ssh_agent = true;
+        request
+            .set_env
+            .push((GUEST_PROFILE_ENV.into(), GUEST_PROFILE_VERSION.into()));
+
+        self.service
+            .update(request)
+            .with_context(|| format!("update smolvm machine '{name}'"))?;
+        Ok(())
     }
 
     pub fn start(&self, name: &str) -> Result<()> {
-        self.checked(
-            Command::new(&self.bin)
-                .arg("machine")
-                .arg("start")
-                .arg("--name")
-                .arg(name),
-            "start machine",
-        )
+        self.service
+            .start(StartMachine::new(name.to_string()))
+            .with_context(|| format!("start smolvm machine '{name}'"))?;
+        Ok(())
     }
 
     pub fn stop(&self, name: &str) -> Result<()> {
-        self.checked(
-            Command::new(&self.bin)
-                .arg("machine")
-                .arg("stop")
-                .arg("--name")
-                .arg(name),
-            "stop machine",
-        )
+        self.service
+            .stop(StopMachine::new(name.to_string()))
+            .with_context(|| format!("stop smolvm machine '{name}'"))?;
+        Ok(())
     }
 
     pub fn delete(&self, name: &str) -> Result<()> {
-        self.checked(
-            Command::new(&self.bin)
-                .arg("machine")
-                .arg("delete")
-                .arg(name)
-                .arg("-f"),
-            "delete machine",
-        )
+        self.service
+            .delete(DeleteMachine::new(name.to_string()))
+            .with_context(|| format!("delete smolvm machine '{name}'"))?;
+        Ok(())
     }
 
-    pub fn update(&self, name: &str, update: &MachineUpdate) -> Result<()> {
-        let mut command = Command::new(&self.bin);
-        command.arg("machine").arg("update").arg(name);
-        command.arg("--net");
-
-        if let Some(remove_volume) = &update.remove_volume {
-            command.arg("--remove-volume").arg(remove_volume);
-        }
-        command.arg("--volume").arg(&update.volume);
-
-        if let Some(remove_port) = &update.remove_port {
-            command.arg("--remove-port").arg(remove_port);
-        }
-        command.arg("--port").arg(&update.port);
-
-        if let Some(cpus) = update.cpus {
-            command.arg("--cpus").arg(cpus.to_string());
-        }
-        if let Some(memory_mib) = update.memory_mib {
-            command.arg("--mem").arg(memory_mib.to_string());
-        }
-        if let Some(storage_gb) = update.storage_gb {
-            command.arg("--storage").arg(storage_gb.to_string());
-        }
-        if let Some(overlay_gb) = update.overlay_gb {
-            command.arg("--overlay").arg(overlay_gb.to_string());
-        }
-
-        self.checked(&mut command, "update machine")
-    }
-
-    pub fn version(&self) -> Result<String> {
-        let output = Command::new(&self.bin)
-            .arg("--version")
-            .output()
-            .with_context(|| format!("run {} --version", self.display_bin()))?;
-        if !output.status.success() {
-            bail!("smolvm --version failed: {}", format_output(&output));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
-    fn checked(&self, command: &mut Command, action: &str) -> Result<()> {
-        let output = command
-            .output()
-            .with_context(|| format!("run {} for {action}", self.display_bin()))?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            bail!("smolvm {action} failed: {}", format_output(&output));
-        }
-    }
-
-    fn display_bin(&self) -> String {
-        self.bin.to_string_lossy().into_owned()
+    pub fn version(&self) -> String {
+        format!("smolvm {} (machine service)", smolvm_crate::VERSION)
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct MachineUpdate {
-    pub remove_volume: Option<String>,
-    pub volume: String,
-    pub remove_port: Option<String>,
-    pub port: String,
-    pub cpus: Option<u8>,
-    pub memory_mib: Option<u32>,
-    pub storage_gb: Option<u64>,
-    pub overlay_gb: Option<u64>,
+fn workspace_mount(config: &MachineConfig) -> Result<HostMount> {
+    HostMount::new(&config.workspace, "/workspace", false)
+        .with_context(|| format!("prepare workspace mount {}", config.workspace.display()))
 }
 
-fn format_output(output: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => format!("exit status {}", output.status),
-        (false, true) => stdout,
-        (true, false) => stderr,
-        (false, false) => format!("{stderr}\n{stdout}"),
-    }
+fn ssh_port(config: &MachineConfig) -> Result<PortMapping> {
+    PortMapping::parse(&format!("{}:22", config.port))
+        .map_err(|error| anyhow::anyhow!("invalid SSH port mapping: {error}"))
 }

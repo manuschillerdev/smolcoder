@@ -1,7 +1,6 @@
 mod app;
 mod ide;
 mod paths;
-mod smolfile;
 mod smolvm;
 mod ssh;
 mod state;
