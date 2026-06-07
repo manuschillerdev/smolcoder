@@ -7,7 +7,7 @@ use crate::{
     ide::{self, CodeOptions, Ide, IntellijOptions, LaunchContext},
     paths,
     smolfile::{self, SmolfileSpec},
-    smolvm::{MachineUpdate, Smolvm},
+    smolvm::{MachineConfig, Smolvm},
     ssh::{self, AuthOptions, SshConfigSpec},
     state::WorkspaceState,
 };
@@ -19,9 +19,6 @@ use crate::{
     about = "Open a smolvm-backed remote SSH coding machine"
 )]
 pub struct Cli {
-    #[arg(long, global = true, default_value = "smolvm", value_name = "BIN")]
-    smolvm: String,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -133,7 +130,7 @@ struct MachineContext {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
-    let smolvm = Smolvm::new(cli.smolvm);
+    let smolvm = Smolvm::new()?;
 
     match cli.command {
         Commands::Open(cmd) => {
@@ -277,14 +274,14 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
 
     match &status {
         None => {
-            smolvm.create(&machine, &smolfile_path)?;
+            smolvm.create(&machine, &machine_config_from_state(&desired))?;
             status = smolvm.status(&machine)?;
         }
         Some(machine_status) if !machine_status.state.is_running() => {
             if let Some(previous) = previous.as_ref().filter(|state| state.machine == machine)
                 && previous.needs_machine_update(&desired)
             {
-                smolvm.update(&machine, &update_from_states(previous, &desired))?;
+                smolvm.update(&machine, &machine_config_from_state(&desired))?;
                 status = smolvm.status(&machine)?;
             }
         }
@@ -308,6 +305,7 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
     {
         smolvm.start(&machine)?;
     }
+    smolvm.configure_ssh(&machine, &desired.authorized_keys)?;
 
     let runtime_dir = paths::runtime_dir(&workspace_id);
     if runtime_dir.exists() {
@@ -345,6 +343,7 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
         smolvm
             .start(&machine)
             .with_context(|| format!("restart {} after SSH readiness failure", machine))?;
+        smolvm.configure_ssh(&machine, &desired.authorized_keys)?;
         ssh::wait_for_ssh(
             &ssh_config,
             &desired.host_alias,
@@ -366,17 +365,14 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
     })
 }
 
-fn update_from_states(previous: &WorkspaceState, desired: &WorkspaceState) -> MachineUpdate {
-    MachineUpdate {
-        remove_volume: (previous.workspace != desired.workspace)
-            .then(|| smolfile::volume_spec(&previous.workspace)),
-        volume: smolfile::volume_spec(&desired.workspace),
-        remove_port: (previous.port != desired.port).then(|| smolfile::port_spec(previous.port)),
-        port: smolfile::port_spec(desired.port),
-        cpus: (previous.cpus != desired.cpus).then_some(desired.cpus),
-        memory_mib: (previous.memory_mib != desired.memory_mib).then_some(desired.memory_mib),
-        storage_gb: (previous.storage_gb != desired.storage_gb).then_some(desired.storage_gb),
-        overlay_gb: (previous.overlay_gb != desired.overlay_gb).then_some(desired.overlay_gb),
+fn machine_config_from_state(state: &WorkspaceState) -> MachineConfig {
+    MachineConfig {
+        workspace: state.workspace.clone(),
+        port: state.port,
+        cpus: state.cpus,
+        memory_mib: state.memory_mib,
+        storage_gb: state.storage_gb,
+        overlay_gb: state.overlay_gb,
     }
 }
 
@@ -462,10 +458,7 @@ fn doctor(smolvm: &Smolvm) -> Result<()> {
     println!("state root: {}", paths::state_root()?.display());
     println!("runtime root: /tmp/smolcoder");
 
-    match smolvm.version() {
-        Ok(version) => println!("smolvm: {version}"),
-        Err(error) => println!("smolvm: missing or unusable ({error:#})"),
-    }
+    println!("smolvm: {}", smolvm.version());
 
     match Command::new("ssh").arg("-V").output() {
         Ok(output) => {

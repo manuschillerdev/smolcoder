@@ -1,11 +1,16 @@
-use std::{
-    ffi::OsString,
-    path::Path,
-    process::{Command, Output},
-};
+use std::{fs, path::PathBuf, time::Duration};
 
+use ::smolvm as smolvm_crate;
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use smolvm_crate::{
+    HostMount,
+    data::network::PortMapping,
+    machine::{
+        CreateMachine, DeleteMachine, ExecMachine, GetMachine, LocalMachineService, MachineService,
+        StartMachine, StopMachine, UpdateMachine,
+    },
+    network::NetworkBackend,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineState {
@@ -52,166 +57,218 @@ pub struct MachineStatus {
     pub state: MachineState,
 }
 
-#[derive(Debug, Deserialize)]
-struct StatusJson {
-    state: String,
+#[derive(Debug, Clone)]
+pub struct MachineConfig {
+    pub workspace: PathBuf,
+    pub port: u16,
+    pub cpus: u8,
+    pub memory_mib: u32,
+    pub storage_gb: u64,
+    pub overlay_gb: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Smolvm {
-    bin: OsString,
+    service: LocalMachineService,
 }
 
 impl Smolvm {
-    pub fn new(bin: impl Into<OsString>) -> Self {
-        Self { bin: bin.into() }
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            service: LocalMachineService::new().context("initialize smolvm machine service")?,
+        })
     }
 
     pub fn status(&self, name: &str) -> Result<Option<MachineStatus>> {
-        let output = Command::new(&self.bin)
-            .args(["machine", "status", "--name", name, "--json"])
-            .output()
-            .with_context(|| format!("run {} machine status", self.display_bin()))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let combined = format!("{stderr}\n{stdout}");
-            if combined.contains("not found") || combined.contains("Vm not found") {
-                return Ok(None);
-            }
-            bail!("smolvm status failed: {}", format_output(&output));
-        }
-
-        let parsed: StatusJson = serde_json::from_slice(&output.stdout)
-            .with_context(|| format!("parse smolvm status for machine '{name}'"))?;
-        Ok(Some(MachineStatus {
-            state: MachineState::from(parsed.state),
+        let status = self
+            .service
+            .status(GetMachine::new(name.to_string()))
+            .with_context(|| format!("load smolvm machine '{name}'"))?;
+        Ok(status.map(|status| MachineStatus {
+            state: MachineState::from(status.state.to_string()),
         }))
     }
 
-    pub fn create(&self, name: &str, smolfile: &Path) -> Result<()> {
-        self.checked(
-            Command::new(&self.bin)
-                .arg("machine")
-                .arg("create")
-                .arg(name)
-                .arg("-s")
-                .arg(smolfile)
-                .arg("--net-backend")
-                .arg("virtio-net"),
-            "create machine",
-        )
+    pub fn create(&self, name: &str, config: &MachineConfig) -> Result<()> {
+        let mut request = CreateMachine::new(name.to_string());
+        request.mounts = vec![workspace_mount(config)?];
+        request.ports = vec![ssh_port(config)?];
+        request.net = true;
+        request.network_backend = Some(NetworkBackend::VirtioNet);
+        request.cpus = config.cpus;
+        request.memory_mib = config.memory_mib;
+        request.storage_gb = Some(config.storage_gb);
+        request.overlay_gb = Some(config.overlay_gb);
+        request.ssh_agent = true;
+        self.service
+            .create(request)
+            .with_context(|| format!("create smolvm machine '{name}'"))?;
+        Ok(())
+    }
+
+    pub fn update(&self, name: &str, config: &MachineConfig) -> Result<()> {
+        let desired_mount = workspace_mount(config)?;
+        let desired_port = ssh_port(config)?;
+        let status = self
+            .service
+            .status(GetMachine::new(name.to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("machine '{name}' not found"))?;
+
+        let mut request = UpdateMachine::new(name.to_string());
+        let existing_mounts: Vec<_> = status.record.host_mounts();
+        request.remove_mounts = existing_mounts
+            .iter()
+            .filter(|mount| **mount != desired_mount)
+            .cloned()
+            .collect();
+        if !existing_mounts.contains(&desired_mount) {
+            request.add_mounts.push(desired_mount);
+        }
+
+        let existing_ports: Vec<_> = status.record.port_mappings();
+        request.remove_ports = existing_ports
+            .iter()
+            .filter(|port| **port != desired_port)
+            .copied()
+            .collect();
+        if !existing_ports.contains(&desired_port) {
+            request.add_ports.push(desired_port);
+        }
+
+        request.cpus = Some(config.cpus);
+        request.memory_mib = Some(config.memory_mib);
+        request.storage_gb = Some(config.storage_gb);
+        request.overlay_gb = Some(config.overlay_gb);
+        request.enable_network = true;
+        request.network_backend = Some(NetworkBackend::VirtioNet);
+        request.enable_ssh_agent = true;
+
+        self.service
+            .update(request)
+            .with_context(|| format!("update smolvm machine '{name}'"))?;
+        Ok(())
     }
 
     pub fn start(&self, name: &str) -> Result<()> {
-        self.checked(
-            Command::new(&self.bin)
-                .arg("machine")
-                .arg("start")
-                .arg("--name")
-                .arg(name),
-            "start machine",
-        )
+        self.service
+            .start(StartMachine::new(name.to_string()))
+            .with_context(|| format!("start smolvm machine '{name}'"))?;
+        Ok(())
     }
 
     pub fn stop(&self, name: &str) -> Result<()> {
-        self.checked(
-            Command::new(&self.bin)
-                .arg("machine")
-                .arg("stop")
-                .arg("--name")
-                .arg(name),
-            "stop machine",
-        )
+        self.service
+            .stop(StopMachine::new(name.to_string()))
+            .with_context(|| format!("stop smolvm machine '{name}'"))?;
+        Ok(())
     }
 
     pub fn delete(&self, name: &str) -> Result<()> {
-        self.checked(
-            Command::new(&self.bin)
-                .arg("machine")
-                .arg("delete")
-                .arg(name)
-                .arg("-f"),
-            "delete machine",
-        )
+        self.service
+            .delete(DeleteMachine::new(name.to_string()))
+            .with_context(|| format!("delete smolvm machine '{name}'"))?;
+        Ok(())
     }
 
-    pub fn update(&self, name: &str, update: &MachineUpdate) -> Result<()> {
-        let mut command = Command::new(&self.bin);
-        command.arg("machine").arg("update").arg(name);
-        command.arg("--net");
+    pub fn configure_ssh(&self, name: &str, authorized_keys: &PathBuf) -> Result<()> {
+        let keys = fs::read_to_string(authorized_keys)
+            .with_context(|| format!("read authorized keys {}", authorized_keys.display()))?;
+        let script = r#"set -eu
+export DEBIAN_FRONTEND=noninteractive
 
-        if let Some(remove_volume) = &update.remove_volume {
-            command.arg("--remove-volume").arg(remove_volume);
-        }
-        command.arg("--volume").arg(&update.volume);
+if ! command -v sshd >/dev/null 2>&1; then
+  if command -v apk >/dev/null 2>&1; then
+    apk add --no-cache \
+      openssh-server openssh-client git ca-certificates curl tar gzip unzip procps libstdc++ bash
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y --no-install-recommends \
+      openssh-server git ca-certificates curl tar gzip unzip procps libstdc++6 bash
+    rm -rf /var/lib/apt/lists/*
+  else
+    echo 'no supported package manager found for SSH bootstrap' >&2
+    exit 1
+  fi
+fi
 
-        if let Some(remove_port) = &update.remove_port {
-            command.arg("--remove-port").arg(remove_port);
-        }
-        command.arg("--port").arg(&update.port);
+: "${AUTHORIZED_KEYS:?smolcoder did not provide AUTHORIZED_KEYS}"
+chown root:root /root 2>/dev/null || true
+chmod 700 /root 2>/dev/null || true
+install -d -m 700 /root/.ssh
+printf '%s\n' "$AUTHORIZED_KEYS" > /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+unset AUTHORIZED_KEYS
 
-        if let Some(cpus) = update.cpus {
-            command.arg("--cpus").arg(cpus.to_string());
-        }
-        if let Some(memory_mib) = update.memory_mib {
-            command.arg("--mem").arg(memory_mib.to_string());
-        }
-        if let Some(storage_gb) = update.storage_gb {
-            command.arg("--storage").arg(storage_gb.to_string());
-        }
-        if let Some(overlay_gb) = update.overlay_gb {
-            command.arg("--overlay").arg(overlay_gb.to_string());
-        }
+ssh-keygen -A
+mkdir -p /run/sshd /etc/ssh/sshd_config.d /var/empty
+chown root:root /var/empty
+chmod 755 /var/empty
+cat > /etc/ssh/sshd_config.d/99-smolcoder.conf <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin prohibit-password
+SetEnv SSH_AUTH_SOCK=/tmp/ssh-agent.sock
+EOF
 
-        self.checked(&mut command, "update machine")
+if command -v pgrep >/dev/null 2>&1 && pgrep -x sshd >/dev/null 2>&1; then
+  exit 0
+fi
+
+(
+  exec </dev/null
+  exec /usr/sbin/sshd -D -e
+) >/tmp/smolcoder-sshd.log 2>&1 &
+
+sleep 1
+if command -v pgrep >/dev/null 2>&1 && pgrep -x sshd >/dev/null 2>&1; then
+  exit 0
+fi
+
+cat /tmp/smolcoder-sshd.log >&2 2>/dev/null || true
+exit 1
+"#;
+        let mut request = ExecMachine::new(
+            name.to_string(),
+            vec!["sh".into(), "-lc".into(), script.into()],
+        );
+        request.env = vec![("AUTHORIZED_KEYS".into(), keys)];
+        request.timeout = Some(Duration::from_secs(600));
+        request.include_record_env = false;
+        let result = self
+            .service
+            .exec(request)
+            .with_context(|| format!("bootstrap SSH inside smolvm machine '{name}'"))?;
+        if result.exit_code != 0 {
+            bail!(
+                "SSH bootstrap failed in machine '{name}' with exit code {}: {}",
+                result.exit_code,
+                format_output_bytes(&result.stdout, &result.stderr)
+            );
+        }
+        Ok(())
     }
 
-    pub fn version(&self) -> Result<String> {
-        let output = Command::new(&self.bin)
-            .arg("--version")
-            .output()
-            .with_context(|| format!("run {} --version", self.display_bin()))?;
-        if !output.status.success() {
-            bail!("smolvm --version failed: {}", format_output(&output));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
-    fn checked(&self, command: &mut Command, action: &str) -> Result<()> {
-        let output = command
-            .output()
-            .with_context(|| format!("run {} for {action}", self.display_bin()))?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            bail!("smolvm {action} failed: {}", format_output(&output));
-        }
-    }
-
-    fn display_bin(&self) -> String {
-        self.bin.to_string_lossy().into_owned()
+    pub fn version(&self) -> String {
+        format!("smolvm {} (machine service)", smolvm_crate::VERSION)
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct MachineUpdate {
-    pub remove_volume: Option<String>,
-    pub volume: String,
-    pub remove_port: Option<String>,
-    pub port: String,
-    pub cpus: Option<u8>,
-    pub memory_mib: Option<u32>,
-    pub storage_gb: Option<u64>,
-    pub overlay_gb: Option<u64>,
+fn workspace_mount(config: &MachineConfig) -> Result<HostMount> {
+    HostMount::new(&config.workspace, "/workspace", false)
+        .with_context(|| format!("prepare workspace mount {}", config.workspace.display()))
 }
 
-fn format_output(output: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+fn ssh_port(config: &MachineConfig) -> Result<PortMapping> {
+    PortMapping::parse(&format!("{}:22", config.port))
+        .map_err(|error| anyhow::anyhow!("invalid SSH port mapping: {error}"))
+}
+
+fn format_output_bytes(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
     match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => format!("exit status {}", output.status),
+        (true, true) => "no output".to_string(),
         (false, true) => stdout,
         (true, false) => stderr,
         (false, false) => format!("{stderr}\n{stdout}"),

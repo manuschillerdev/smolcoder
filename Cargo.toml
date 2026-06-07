@@ -13,3 +13,4 @@ hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+smolvm = { path = "../smolvm.expose-machine-api" }

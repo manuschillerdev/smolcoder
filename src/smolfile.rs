@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct SmolfileSpec {
@@ -99,14 +99,6 @@ fn toml_string(value: &str) -> String {
     }
     out.push('"');
     out
-}
-
-pub fn volume_spec(workspace: &Path) -> String {
-    format!("{}:/workspace", workspace.display())
-}
-
-pub fn port_spec(port: u16) -> String {
-    format!("{}:22", port)
 }
 
 #[cfg(test)]

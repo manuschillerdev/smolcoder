@@ -10,9 +10,9 @@ smolcoder open --ide intellij
 ## What it manages
 
 - Stable per-workspace machine names
-- Create/start/update of the backing `smolvm` machine
-- Debian `bookworm-slim` guest with root SSH login
-- `virtio-net` networking for reliable SSH forwarding
+- Create/start/update of the backing embedded `smolvm` machine
+- Alpine-backed guest with root SSH login
+- Localhost SSH port forwarding into the machine
 - SSH public key or `authorized_keys` staging
 - Isolated `ssh_config` and `known_hosts`
 - Local SSH port selection
@@ -58,7 +58,6 @@ smolcoder open --recreate
 
 ## Requirements
 
-- `smolvm` in `PATH`
 - `ssh` in `PATH`
 - `code` in `PATH` for VS Code launches
 - A usable SSH public key, or an explicit `--public-key` / `--authorized-keys`
