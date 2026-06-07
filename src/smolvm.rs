@@ -55,7 +55,39 @@ impl From<String> for MachineState {
 #[derive(Debug, Clone)]
 pub struct MachineStatus {
     pub state: MachineState,
+    pub image: Option<String>,
 }
+
+pub const GUEST_IMAGE: &str = "debian:bookworm-slim";
+
+const GUEST_INIT: &str = r#"set -eu
+export DEBIAN_FRONTEND=noninteractive
+
+if ! command -v sshd >/dev/null 2>&1; then
+  apt-get update
+  apt-get install -y --no-install-recommends \
+    openssh-server git ca-certificates curl tar gzip unzip procps libstdc++6 bash
+  rm -rf /var/lib/apt/lists/*
+fi
+
+chown root:root /root 2>/dev/null || true
+chmod 700 /root 2>/dev/null || true
+install -d -m 700 /root/.ssh
+touch /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+
+ssh-keygen -A
+mkdir -p /run/sshd /etc/ssh/sshd_config.d /var/empty
+chown root:root /var/empty
+chmod 755 /var/empty
+cat > /etc/ssh/sshd_config.d/99-smolcoder.conf <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin prohibit-password
+SetEnv SSH_AUTH_SOCK=/tmp/ssh-agent.sock
+EOF
+"#;
 
 #[derive(Debug, Clone)]
 pub struct MachineConfig {
@@ -86,11 +118,15 @@ impl Smolvm {
             .with_context(|| format!("load smolvm machine '{name}'"))?;
         Ok(status.map(|status| MachineStatus {
             state: MachineState::from(status.state.to_string()),
+            image: status.record.image.clone(),
         }))
     }
 
     pub fn create(&self, name: &str, config: &MachineConfig) -> Result<()> {
         let mut request = CreateMachine::new(name.to_string());
+        request.image = Some(GUEST_IMAGE.to_string());
+        request.init = vec![GUEST_INIT.into()];
+        request.cmd = vec!["/usr/sbin/sshd".into(), "-D".into(), "-e".into()];
         request.mounts = vec![workspace_mount(config)?];
         request.ports = vec![ssh_port(config)?];
         request.net = true;

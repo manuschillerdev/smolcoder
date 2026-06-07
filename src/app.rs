@@ -7,7 +7,7 @@ use crate::{
     ide::{self, CodeOptions, Ide, IntellijOptions, LaunchContext},
     paths,
     smolfile::{self, SmolfileSpec},
-    smolvm::{MachineConfig, Smolvm},
+    smolvm::{GUEST_IMAGE, MachineConfig, Smolvm},
     ssh::{self, AuthOptions, SshConfigSpec},
     state::WorkspaceState,
 };
@@ -216,6 +216,19 @@ fn ensure_machine(smolvm: &Smolvm, opts: &MachineCmd) -> Result<MachineContext> 
         bail!(
             "machine '{}' already exists but smolcoder state for this workspace is missing or points elsewhere; pass --recreate to rebuild it",
             machine
+        );
+    }
+
+    if let Some(machine_status) = &status
+        && machine_status.image.as_deref() != Some(GUEST_IMAGE)
+        && !opts.recreate
+    {
+        let current = machine_status.image.as_deref().unwrap_or("bare VM");
+        bail!(
+            "machine '{}' uses {} but smolcoder requires image {}; pass --recreate to rebuild it",
+            machine,
+            current,
+            GUEST_IMAGE
         );
     }
 
